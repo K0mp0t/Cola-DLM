@@ -351,7 +351,7 @@ def generate_task_repaint_inference(
 
     scale = vae.scaling_factor
     shift = vae.shifting_factor
-    patch_size = vae.patch_size
+    patch_size = vae.patch_size * vae.sequence_compression_ratio
     block_size = dit.block_size
 
     def _diffusion_dt(t_curr, t_next):
@@ -362,6 +362,7 @@ def generate_task_repaint_inference(
     # -----------------------------------------------------------------
     batch_prompts_text: list[str] = []
     input_ids_list: list[torch.Tensor] = []
+    input_src_key_padding_masks: list[torch.Tensor] = []
     token_labels_list: list[torch.Tensor] = []
     prompt_len_remainders: list[int] = []
 
@@ -392,9 +393,15 @@ def generate_task_repaint_inference(
 
         p_pad_len = (chunk - len(ids) % chunk) % chunk
         t_labels = [1] * len(ids) + [3] * p_pad_len
+        src_key_padding_mask = torch.cat([
+            torch.zeros((len(ids),), dtype=torch.bool, device=device),
+            torch.ones((p_pad_len,), dtype=torch.bool, device=device)
+        ], dim=0)
+
         ids = ids + [pad_token_id] * p_pad_len
 
         input_ids_list.append(torch.tensor(ids, dtype=torch.long, device=device))
+        input_src_key_padding_masks.append(src_key_padding_mask)
         token_labels_list.append(torch.tensor(t_labels, dtype=torch.long, device=device))
 
     batch_size = len(input_ids_list)
@@ -405,8 +412,30 @@ def generate_task_repaint_inference(
     # Posterior mode ``(mode() - shift) * scale`` in fp32 — matches the
     # trainer's ``latents_3d = ... .float()`` after the autocast block.
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        enc = vae.encode(input_ids_list)
+        attention_masks = [torch.logical_not(e) for e in input_src_key_padding_masks]
+        enc = vae.encode(input_ids_list, attention_masks)
         latents_list = [((lat - shift) * scale).float() for lat in enc.latents_list]
+
+        # print('raw prefix lens', [torch.sum(m).item() for m in attention_masks])
+        # print('pad lens', [len(m) - torch.sum(m).item() for m in attention_masks])
+
+        # decoded = vae.decode(
+        #     z=latents_list,
+        # )
+
+        # pseudo_mean_ce = torch.mean(torch.as_tensor([F.cross_entropy(d[m].permute(1, 0).unsqueeze(0), i[m].unsqueeze(0)) for d, i, m in zip(decoded, input_ids_list, attention_masks)]))
+        # print('pseudo_mean_ce', pseudo_mean_ce.item())
+
+        # decoded = vae.forward_with_a_list(input_ids_list, src_key_padding_masks_list=input_src_key_padding_masks, variance=False)
+        # pseudo_mean_ce = torch.mean(torch.as_tensor([F.cross_entropy(d[m].permute(1, 0).unsqueeze(0), i[m].unsqueeze(0)) for d, i, m in zip(decoded, input_ids_list, attention_masks)]))
+        # print('pseudo_mean_ce full forward', pseudo_mean_ce.item())
+
+        # decoded = list()
+        # for input_ids, src_key_padding_mask in zip(input_ids_list, input_src_key_padding_masks):
+        #     decoded_, _, _ = vae.forward(torch.as_tensor(input_ids).unsqueeze(0), src_key_padding_mask=src_key_padding_mask.unsqueeze(0))
+        #     decoded.append(decoded_)
+        # pseudo_mean_ce = torch.mean(torch.as_tensor([F.cross_entropy(d[:, m].permute(0, 2, 1), i[m].unsqueeze(0)) for d, i, m in zip(decoded, input_ids_list, attention_masks)]))
+        # print('pseudo_mean_ce regular forward', pseudo_mean_ce.item())
 
     # -----------------------------------------------------------------
     # Step 3: latent labels per sample + first-generation-block layout
@@ -477,12 +506,6 @@ def generate_task_repaint_inference(
     # Step 4: prefix KV prefetch (DiT + VAE decoder), NA form
     # -----------------------------------------------------------------
     timesteps = torch.linspace(int(T), 0, timestep_num + 1, dtype=torch.float32)
-
-    # Enable KV cache on both models.
-    for block in dit.blocks:
-        block.set_kv_cache(True)
-    vae.set_kv_cache(True)
-
     prefix_lens = [p.shape[0] for p in prefix_list]
     txt_shape_prefix = _shape_tensor(prefix_lens, device)
 
@@ -509,13 +532,17 @@ def generate_task_repaint_inference(
                 update_kv=True,
                 use_kv_cache=True,
             )
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            _ = vae.decode(
-                z=torch.cat(prefix_list, dim=0),
-                txt_shape=txt_shape_prefix,
-                txt_q_shape=txt_shape_prefix,
-                update_kv=True,
-            )
+        batched_prefix = prefix_list
+        # print('prefix lens', [len(e) for e in prefix_list])
+        # with torch.autocast("cuda", dtype=torch.bfloat16):
+        #     _ = vae.decode(
+        #         z=torch.cat(prefix_list, dim=0),
+        #         txt_shape=txt_shape_prefix,
+        #         txt_q_shape=txt_shape_prefix,
+        #         update_kv=True,
+        #     )
+    else:
+        batched_prefix = None
 
     # -----------------------------------------------------------------
     # Step 5: block-wise generation loop
@@ -656,15 +683,24 @@ def generate_task_repaint_inference(
 
         # ------------ decode one block via VAE (NA) ----------------
         with torch.autocast("cuda", dtype=torch.bfloat16):
+            if batched_prefix is not None:
+                # print('batched_prefix is not None', [len(e) for e in batched_prefix])
+                batched_prefix = [torch.cat([p, c], dim=0) for p, c in zip(batched_prefix, txt.view(batch_size, block_size, latent_dim))]
+                # print('batched_prefix is not None', [len(e) for e in batched_prefix])
+            else:
+                batched_prefix = txt.view(batch_size, block_size, latent_dim)   
+                # print('batched_prefix is None', [len(e) for e in batched_prefix])            
             decoded = vae.decode(
-                z=txt,
-                txt_shape=txt_shape_cum,
-                txt_q_shape=txt_q_shape,
-                update_kv=True,
+                z=batched_prefix,
             )
+            # print('decoded', [d.shape for d in decoded])
         # ``decoded`` is (1, B*block_size*patch_size, vocab) — same
         # per-sample ordering as the NA layout, reshape to (B, block_size*patch_size, vocab).
-        decoded_logits = decoded.view(batch_size, block_size * patch_size, -1)
+        # decoded_logits = decoded.view(batch_size, block_size * patch_size, -1)
+        max_len = max(list(map(len, decoded)))
+        pad_ohe = torch.zeros((1, decoded[0].shape[-1],), dtype=decoded[0].dtype, device=device)
+        pad_ohe[0, pad_token_id] = 1
+        decoded_logits = torch.stack([torch.cat([d, pad_ohe.repeat(max_len-d.shape[0], 1)], dim=0) for d in decoded], dim=0)
 
         one_block_ids = sample_with_strategies(
             decoded_logits,
@@ -675,10 +711,12 @@ def generate_task_repaint_inference(
             repetition_penalty=repetition_penalty,
         )
 
-        if context_ids is None:
-            context_ids = one_block_ids
-        else:
-            context_ids = torch.cat([context_ids, one_block_ids], dim=1)
+        # if context_ids is None:
+        #     context_ids = one_block_ids
+        # else:
+        #     context_ids = torch.cat([context_ids, one_block_ids], dim=1)
+
+        context_ids = one_block_ids
 
         for b in range(one_block_ids.shape[0]):
             if eos_token_id is not None and eos_token_id in one_block_ids[b]:
@@ -706,10 +744,8 @@ def generate_task_repaint_inference(
         elif step * block_size * patch_size >= max_new_tokens:
             stop_flag = True
 
-    # Clean up KV cache
     for block in dit.blocks:
         block.set_kv_cache(False)
-    vae.set_kv_cache(False)
 
     # -----------------------------------------------------------------
     # Step 6: trim the leading prompt slice out of each sample's output
@@ -718,9 +754,14 @@ def generate_task_repaint_inference(
     prompt_trim_counts = first_block_prompt_token_counts.detach().cpu().tolist()
     trimmed_ids = []
     for sample_idx, trim_count in enumerate(prompt_trim_counts):
+        trim_count += prefix_lens[sample_idx] * patch_size
         trim_count = max(0, min(int(trim_count), context_ids_cpu.shape[1]))
         trimmed_ids.append(context_ids_cpu[sample_idx, trim_count:].tolist())
     generated_texts = tokenizer.decode_batch(trimmed_ids, skip_special_tokens=False)
+    generated_texts_full = tokenizer.decode_batch([e.tolist() for e in context_ids_cpu], skip_special_tokens=False)
+
+    # print('trim_counts:', prompt_trim_counts, prefix_lens, [i + j * patch_size for i, j in zip(prompt_trim_counts, prefix_lens)])
+    # print('decoded_ids size', [len(e) for e in generated_texts])
 
     results: list[dict] = []
     for idx, gen_text in enumerate(generated_texts):
@@ -728,6 +769,7 @@ def generate_task_repaint_inference(
             "id": prompts[idx].get("id"),
             "prompt": batch_prompts_text[idx],
             "generate": gen_text,
+            "generate_full": generated_texts_full[idx],
             "ground_truth": prompts[idx].get("answer", prompts[idx].get("ground_truth", "")),
         }
         if prompts[idx].get("choices"):
@@ -787,6 +829,32 @@ def main():
 
     print(f"Loading tokenizer from {args.tokenizer_path}...")
     tokenizer = Tokenizer.from_file(args.tokenizer_path)
+
+    dummy_data = {"question": "Statement 1 | Every homomorphic image of a group G is isomorphic to a factor group of G. Statement 2 | The homomorphic images of a group G are the same (up to isomorphism) as the factor groups of G.", "choices": ["True, True", "False, False", "True, False", "False, True"], "answer": "True, True", "id": 6}
+    prompt_str = apply_prompt_template(
+        task='mmlu',
+        context=dummy_data.get("context", ""),
+        question=dummy_data.get("question", ""),
+        answer=dummy_data.get("ground_truth", dummy_data.get("answer", "")),
+        choices=dummy_data.get("choices", None),
+    )
+    ids = tokenizer.encode(prompt_str).ids
+    chunk_size = 16
+    p_pad_len = 16 - len(ids) % 16
+
+    src_key_padding_mask = torch.cat([
+        torch.zeros((len(ids),), dtype=torch.bool, device=device),
+        torch.ones((p_pad_len,), dtype=torch.bool, device=device)
+    ], dim=0).unsqueeze(0).to(device)
+
+    ids = torch.as_tensor(ids + [100277] * p_pad_len).unsqueeze(0).to(device)
+
+    decoded, _, _ = vae.forward(ids, src_key_padding_mask=src_key_padding_mask)
+
+    full_ce = F.cross_entropy(decoded.permute(0, 2, 1), ids)
+    truncated_ce = F.cross_entropy(decoded[:, :-p_pad_len].permute(0, 2, 1), ids[:, :-p_pad_len])
+
+    print(full_ce, truncated_ce)
 
     raw_data = []
     with open(args.input_jsonl, encoding="utf-8") as f:

@@ -61,6 +61,116 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+
+@torch.compile(dynamic=False, fullgraph=True)
+def muon_step_fused_tall(
+    stacked_grads: Tensor, stacked_params: Tensor,
+    momentum_buffer: Tensor, second_momentum_buffer: Tensor,
+    momentum_t: Tensor, lr_t: Tensor, wd_t: Tensor, beta2_t: Tensor,
+    ns_steps: int,
+) -> None:
+    red_dim = -1
+
+    # Nesterov momentum
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    # Polar Express orthogonalization
+    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+
+    for a, b, c in polar_express_coeffs[:ns_steps]:
+        A = X.mT @ X
+        B = b * A + c * (A @ A)
+        X = a * X + X @ B
+
+    # if g.size(-2) > g.size(-1):
+    #     for a, b, c in polar_express_coeffs[:ns_steps]:
+    #         A = X.mT @ X
+    #         B = b * A + c * (A @ A)
+    #         X = a * X + X @ B
+    # else:
+    #     for a, b, c in polar_express_coeffs[:ns_steps]:
+    #         A = X @ X.mT
+    #         B = b * A + c * (A @ A)
+    #         X = a * X + B @ X
+    g = X
+
+    # NorMuon variance reduction
+    beta2 = beta2_t.to(g.dtype)
+    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = g.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm = v_norm_sq.sqrt()
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2_t)
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale.to(g.dtype)
+
+    # Cautious weight decay + parameter update
+    lr = lr_t.to(g.dtype)
+    wd = wd_t.to(g.dtype)
+    mask = (g * stacked_params) >= 0
+    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def muon_step_fused_wide(
+    stacked_grads: Tensor, stacked_params: Tensor,
+    momentum_buffer: Tensor, second_momentum_buffer: Tensor,
+    momentum_t: Tensor, lr_t: Tensor, wd_t: Tensor, beta2_t: Tensor,
+    ns_steps: int,
+) -> None:
+    red_dim = -2
+
+    # Nesterov momentum
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    # Polar Express orthogonalization
+    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+    # if g.size(-2) > g.size(-1):
+    #     for a, b, c in polar_express_coeffs[:ns_steps]:
+    #         A = X.mT @ X
+    #         B = b * A + c * (A @ A)
+    #         X = a * X + X @ B
+    # else:
+    #     for a, b, c in polar_express_coeffs[:ns_steps]:
+    #         A = X @ X.mT
+    #         B = b * A + c * (A @ A)
+    #         X = a * X + B @ X
+
+    for a, b, c in polar_express_coeffs[:ns_steps]:
+        A = X @ X.mT
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    g = X
+
+    # NorMuon variance reduction
+    beta2 = beta2_t.to(g.dtype)
+    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = g.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm = v_norm_sq.sqrt()
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2_t)
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale.to(g.dtype)
+
+    # Cautious weight decay + parameter update
+    lr = lr_t.to(g.dtype)
+    wd = wd_t.to(g.dtype)
+    mask = (g * stacked_params) >= 0
+    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
     stacked_grads: Tensor, stacked_params: Tensor,
@@ -181,12 +291,24 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
 
-        muon_step_fused(
+        if shape[-2] >= shape[-1]:
+            muon_step_func = muon_step_fused_tall
+        else:
+            muon_step_func = muon_step_fused_wide
+
+        muon_step_func(
             stacked_grads, stacked_params,
             state["momentum_buffer"], state["second_momentum_buffer"],
             self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-            group["ns_steps"], red_dim,
+            group["ns_steps"]
         )
+        
+        # muon_step_fused(
+        #     stacked_grads, stacked_params,
+        #     state["momentum_buffer"], state["second_momentum_buffer"],
+        #     self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+        #     group["ns_steps"], red_dim,
+        # )
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
     @torch.no_grad()
@@ -238,7 +360,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 assert grad.shape[0] % world_size == 0
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
-                future = dist.reduce_scatter_tensor(
+                future = dist.reduce_scatter_single(
                     grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True
                 ).get_future()
                 param_infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False)
@@ -258,7 +380,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
             stacked_grads[len(params) :].zero_()
 
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
-        future = dist.reduce_scatter_tensor(
+        future = dist.reduce_scatter_single(
             grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True
         ).get_future()
         return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
@@ -295,7 +417,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
             )
 
             if not pinfo["is_small"]:
-                future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
+                future = dist.all_gather_single(p, p_slice, async_op=True).get_future()
                 gather_list.append(dict(future=future, params=None))
 
     def _compute_muon(self, group, info, gather_list, rank):
@@ -326,19 +448,32 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._muon_beta2_t.fill_(group["beta2"])
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(
+            
+            if shape[-2] >= shape[-1]:
+                muon_step_func = muon_step_fused_tall
+            else:
+                muon_step_func = muon_step_fused_wide
+
+            muon_step_func(
                 grad_chunk[:num_owned], stacked_owned,
                 state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
                 self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                group["ns_steps"], red_dim,
+                group["ns_steps"]
             )
+            
+            # muon_step_fused(
+            #     grad_chunk[:num_owned], stacked_owned,
+            #     state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+            #     self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+            #     group["ns_steps"], red_dim,
+            # )
             updated_params[:num_owned].copy_(stacked_owned)
 
         if num_owned < chunk_size:
             updated_params[num_owned:].zero_()
 
         stacked_params = info["stacked_grads"]
-        future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
+        future = dist.all_gather_single(stacked_params, updated_params, async_op=True).get_future()
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
 
     def _finish_gathers(self, gather_list):

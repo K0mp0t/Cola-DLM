@@ -13,10 +13,10 @@ flow matching with the 2L trick. Supports two optimizer modes:
       Uses DDP wrapper for gradient sync.
 
 Single-GPU:
-    python scripts/cola_pretrain.py --num-iterations=100 --run=dummy
+    torchrun --standalone --nproc_per_node=1 scripts/cola_pretrain_custom_vae.py --run=my_run
 
 Multi-GPU:
-    torchrun --standalone --nproc_per_node=8 scripts/cola_pretrain.py --run=my_run
+    torchrun --standalone --nproc_per_node=8 scripts/cola_pretrain_custom_vae.py --run=my_run
 """
 
 import argparse
@@ -44,7 +44,7 @@ parser.add_argument("--dit-head-dim", type=int, default=128)
 parser.add_argument("--dit-expand-ratio", type=int, default=4)
 parser.add_argument("--dit-block-size", type=int, default=16)
 # VAE (frozen, pretrained)
-parser.add_argument("--vae-path", type=str, default="hf_models/cola_dlm/cola_vae")
+parser.add_argument("--vae-path", type=str, default="hf_models/custom_lc_vae_fineweb")
 parser.add_argument("--tokenizer-path", type=str, default="hf_models/tokenizer.json")
 # Output
 parser.add_argument("--output-dir", type=str, default="cola_pretrain_checkpoints")
@@ -129,6 +129,7 @@ else:
 # Load VAE (frozen) and build DiT from scratch
 # ---------------------------------------------------------------------------
 from cola_dlm import ColaTextVAEModel, ColaDiTModel
+from cola_dlm.modeling_custom_vae import CustomTextVAEModel
 from cola_dlm.configuration_cola_dit import ColaDiTConfig
 from cola_dlm.attention_utils import create_2l_block_causal_mask
 
@@ -141,7 +142,7 @@ if attn_backend == "flex":
     from cola_dlm.attention_utils import create_2l_flex_block_mask
 
 print0("Loading VAE...")
-vae = ColaTextVAEModel.from_pretrained(args.vae_path).to(device).eval()
+vae = CustomTextVAEModel.from_pretrained(args.vae_path).to(device).eval()
 for p in vae.parameters():
     p.requires_grad_(False)
 
@@ -149,8 +150,6 @@ print0("Initializing DiT from scratch...")
 dit_config = ColaDiTConfig(
     txt_in_channels=vae.config.latent_dim,
     txt_out_channels=vae.config.latent_dim,
-    # txt_dim=args.dit_txt_dim,
-    # emb_dim=args.dit_txt_dim,
     txt_dim=args.dit_heads * args.dit_head_dim,
     emb_dim=args.dit_heads * args.dit_head_dim,
     heads=args.dit_heads,
@@ -336,17 +335,17 @@ def get_weight_decay_schedule(step):
 # ---------------------------------------------------------------------------
 from cola_dlm.dataloader import pretrain_data_loader
 
-STOP_TOKEN_ID = 47774
+PAD_TOKEN_ID = 100277
 
 print0("Initializing data loader...")
 data_dir = os.path.abspath(args.data_dir)
 train_loader = pretrain_data_loader(
     args.tokenizer_path, data_dir, args.device_batch_size, args.max_seq_len,
-    split="train", device=device,
+    split="train", device=device, bos_token_id=100257
 )
 val_loader = pretrain_data_loader(
     args.tokenizer_path, data_dir, args.device_batch_size, args.max_seq_len,
-    split="val", device=device,
+    split="val", device=device, bos_token_id=100257
 )
 
 # ---------------------------------------------------------------------------
@@ -400,6 +399,7 @@ def sample_timestep(batch_size):
 # ---------------------------------------------------------------------------
 def prepare_batch(inputs):
     B = inputs.shape[0]
+
     batch = []
     for i in range(B):
         bs = sample_block_size()
@@ -409,7 +409,7 @@ def prepare_batch(inputs):
         if pad_len > 0:
             token_row = torch.cat([
                 token_row,
-                torch.full((pad_len,), STOP_TOKEN_ID, device=device, dtype=torch.long),
+                torch.full((pad_len,), PAD_TOKEN_ID, device=device, dtype=torch.long),
             ])
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             enc = vae.encode([token_row])
@@ -559,7 +559,7 @@ def save_checkpoint(step, val_loss):
     ckpt_dir = os.path.join(args.output_dir, args.run)
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    dit_path = os.path.join(ckpt_dir, f"dit_step_{step:06d}")
+    dit_path = os.path.join(ckpt_dir, f"dit")
     orig_dit.save_pretrained(dit_path)
 
     meta = {"step": step, "val_fm_loss": val_loss, "config": vars(args)}
