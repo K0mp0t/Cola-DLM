@@ -249,14 +249,14 @@ Reference accuracy numbers (see [`eval_output/accuracy_summary.csv`](eval_output
 | MMLU       | 19.30        |
 | OBQA       | 23.00        |
 | HellaSwag  | 10.70        |
-| RACE       | 19.60        |
-| SIQA       | 28.90        |
+| RACE       | 19.30        |
+| SIQA       | 28.40        |
 | SQuAD      | 30.90        |
 | Story Cloze| 30.77        |
-| **Tasks Average** | **26.75** |
+| **Tasks Average** | **26.65** |
 
 > **Note on open-source model and accuracy:**
-> The released model weights correspond to the **2000 EFLOPs** entry on the scaling curve in the paper's RQ4 — the largest training-compute checkpoint reported. Because the internal architecture used for evaluation in the paper differs slightly from the open-source HuggingFace Transformers-based implementation in this repository, per-task accuracy numbers may exhibit minor fluctuations, but the overall trend is consistent with the paper. Notably, the **Tasks Average (26.75%) measured here is slightly higher than the final average reported in the paper**.
+> The released model weights correspond to the **2000 EFLOPs** entry on the scaling curve in the paper's RQ4 — the largest training-compute checkpoint reported. Because the internal architecture used for evaluation in the paper differs slightly from the open-source HuggingFace Transformers-based implementation in this repository, per-task accuracy numbers may exhibit minor fluctuations, but the overall trend is consistent with the paper. Notably, the **Tasks Average (26.65%) measured here is slightly higher than the final average reported in the paper**.
 
 ---
 

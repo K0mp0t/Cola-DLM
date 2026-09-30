@@ -153,33 +153,48 @@ def apply_prompt_template(task: str, context: str, question: str, answer: str, c
     elif task == "race":
         choices = choices or []
         current_choices_text = "\n".join([f"({chr(65+i)}) {choice}" for i, choice in enumerate(choices)])
+        # Put the passage under "Article:" and, when the question is supplied as
+        # its own field, label it under "Question:". Datasets that inline the
+        # question into the passage keep everything under "Article:".
+        if context:
+            current_item = f"Article: {context}\nQuestion: {question}\n"
+        else:
+            current_item = f"Article: {question}\n"
         return (
             "Read the following article and answer the question.\n\n"
-            "Article: Mary went to the store to buy some fruits. She bought five apples and two oranges. She paid 5 dollars in total. What did Mary buy?\n"
+            "Article: Mary went to the store to buy some fruits. She bought five apples and two oranges. She paid 5 dollars in total.\n"
+            "Question: What did Mary buy?\n"
             "Options:\n"
             "(A) Bananas\n"
             "(B) Apples and oranges\n"
             "(C) Grapes\n"
             "(D) Watermelon\n"
             "Answer: Apples and oranges\n\n"
-            f"Article: {question}\n"
+            f"{current_item}"
             f"Options:\n{current_choices_text}\n"
             "Answer:"
         )
     elif task == "siqa":
         choices = choices or []
         current_choices_text = "\n".join([f"({chr(65+i)}) {choice}" for i, choice in enumerate(choices)])
+        # Social IQa questions are under-determined without their situational
+        # context, so surface it on a dedicated "Context:" line. Datasets that
+        # inline the context into the question leave this field empty.
+        context_block = f"Context: {context}\n" if context else ""
         return (
-            "Question: Jordan wanted to tell a joke to his friends. What does Jordan need to do before this?\n"
+            "Context: Jordan wanted to tell a joke to his friends.\n"
+            "Question: What does Jordan need to do before this?\n"
             "(A) ignore his friends\n"
             "(B) think of a funny story\n"
             "(C) leave the room\n"
             "Answer: think of a funny story\n\n"
-            "Question: Kai helped his neighbor carry heavy groceries inside. How would the neighbor feel?\n"
+            "Context: Kai helped his neighbor carry heavy groceries inside.\n"
+            "Question: How would the neighbor feel?\n"
             "(A) angry\n"
             "(B) grateful\n"
             "(C) scared\n"
             "Answer: grateful\n\n"
+            f"{context_block}"
             f"Question: {question}\n"
             f"{current_choices_text}\n"
             "Answer:"

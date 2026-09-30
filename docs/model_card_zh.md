@@ -56,14 +56,14 @@
 | MMLU          | 19.30       |
 | OBQA          | 23.00       |
 | HellaSwag     | 10.70       |
-| RACE          | 19.60       |
-| SIQA          | 28.90       |
+| RACE          | 19.30       |
+| SIQA          | 28.40       |
 | SQuAD         | 30.90       |
 | Story Cloze   | 30.77       |
-| **Tasks Average** | **26.75** |
+| **Tasks Average** | **26.65** |
 
 > **关于开源模型与准确率说明：**
-> 当前开源的模型权重对应论文 RQ4 scaling 曲线中训练量最大的 **2000 EFLOPs** checkpoint。由于论文中评测使用的内部模型架构与本仓库基于 HuggingFace Transformers 重构的开源架构存在细微差异，各任务的准确率数值会有小幅波动，但整体趋势与论文报告一致。此外，本仓库测出的 **Tasks Average（26.75%）高于论文中报告的最终平均水平**。
+> 当前开源的模型权重对应论文 RQ4 scaling 曲线中训练量最大的 **2000 EFLOPs** checkpoint。由于论文中评测使用的内部模型架构与本仓库基于 HuggingFace Transformers 重构的开源架构存在细微差异，各任务的准确率数值会有小幅波动，但整体趋势与论文报告一致。此外，本仓库测出的 **Tasks Average（26.65%）高于论文中报告的最终平均水平**。
 
 完整评测协议见 [`eval_output/accuracy_summary.csv`](../eval_output/accuracy_summary.csv) 与 [`scripts/run_benchmark.sh`](../scripts/run_benchmark.sh)。
 
