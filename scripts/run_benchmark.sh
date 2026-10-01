@@ -36,10 +36,20 @@ export COLA_INFER_PER_SAMPLE_NOISE_SEED="${COLA_INFER_PER_SAMPLE_NOISE_SEED:-66}
 # ---------- configurable paths ----------
 DIT_PATH="${DIT_PATH:-${REPO_DIR}/hf_models/cola_dlm/cola_dit}"
 VAE_PATH="${VAE_PATH:-${REPO_DIR}/hf_models/cola_dlm/cola_vae}"
-TOKENIZER_PATH="${TOKENIZER_PATH:-${REPO_DIR}/hf_models/tokenizer.json}"
-TASK_DATA_DIR="${TASK_DATA_DIR:-${REPO_DIR}/generate_task_data}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/eval_output/tasks_default}"
 
+VAE_TYPE="${VAE_TYPE:-causal}"
+
+if [ "$VAE_TYPE" == "causal" ]; then
+    INFERENCE_COMMAND="cola_dlm.inference"
+else
+    INFERENCE_COMMAND="cola_dlm.inference_bidirectional_vae"
+fi
+
+echo $INFERENCE_COMMAND
+
+TOKENIZER_PATH="${TOKENIZER_PATH:-${REPO_DIR}/hf_models/tokenizer.json}"
+TASK_DATA_DIR="${TASK_DATA_DIR:-${REPO_DIR}/generate_task_data}"
 # ---------- inference parameters ----------
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-7.0}"
 TIMESTEP_NUM="${TIMESTEP_NUM:-16}"
@@ -126,7 +136,7 @@ for TASK in "${TASKS[@]}"; do
         PIDS=()
         FAIL=0
         for GPU_ID in $(seq 0 $((NUM_GPUS - 1))); do
-            CUDA_VISIBLE_DEVICES=$GPU_ID python -m cola_dlm.inference \
+            CUDA_VISIBLE_DEVICES=$GPU_ID python -m $INFERENCE_COMMAND \
                 --dit_path "$DIT_PATH" \
                 --vae_path "$VAE_PATH" \
                 --tokenizer_path "$TOKENIZER_PATH" \
@@ -168,7 +178,7 @@ for TASK in "${TASKS[@]}"; do
             fi
         done
     else
-        python -m cola_dlm.inference \
+        python -m $INFERENCE_COMMAND \
             --dit_path "$DIT_PATH" \
             --vae_path "$VAE_PATH" \
             --tokenizer_path "$TOKENIZER_PATH" \
