@@ -21,7 +21,3 @@ You should change several arguments there:
 1. ```--data-dir``` should be the path to the directory where you put FineWeb-10B parquets
 2. ```--run``` should be the desired name of the run (```--run=dummy``` disables wandb)
 3. ```--vae-path``` should be the path to the VAE you want to use (Cola-based scripts can only use Cola's VAE, mine can only use mine)
-
-# Experiments I want to run now
-
-1. Smallscale versions of previous experiments: vanilla Cola with ~1.75x smaller DiT and same DiT with my VAE
