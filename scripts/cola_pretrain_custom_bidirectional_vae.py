@@ -552,6 +552,7 @@ def evaluate(dit_model, eval_steps):
     dit_model.eval()
     losses = []
     relative_errors = []
+    relative_errors_bins = [list() for _ in range(10)]
     for _ in range(eval_steps):
         inputs, _, _ = next(val_loader)
         batch = prepare_batch(inputs, 0)
@@ -560,6 +561,13 @@ def evaluate(dit_model, eval_steps):
         relative_error = relative_errors_.mean()
         losses.append(loss.item())
         relative_errors.append(relative_error.item())
+
+        for re, t in zip(relative_errors_, ts):
+            relative_errors_bins[int(t * 10)].append(re)
+
+    relative_error_binsizes = torch.as_tensor([len(e) for e in relative_errors_bins]).to(device)
+    relative_errors_bins = torch.as_tensor([torch.as_tensor(e).sum() for e in relative_errors_bins]).to(device)
+
     dit_model.train()
     avg_loss = sum(losses) / len(losses)
     avg_relative_error = sum(relative_errors) / len(relative_errors)
@@ -571,7 +579,13 @@ def evaluate(dit_model, eval_steps):
         relative_error_tensor = torch.tensor([avg_relative_error], device=device)
         dist.all_reduce(relative_error_tensor, op=dist.ReduceOp.AVG)
         avg_relative_error = relative_error_tensor.item()
-    return avg_loss, avg_relative_error
+
+        dist.all_reduce(relative_errors_bins, op=dist.ReduceOp.SUM)
+        dist.all_reduce(relative_error_binsizes, op=dist.ReduceOp.SUM)
+
+    relative_errors_bins = relative_errors_bins / relative_error_binsizes.clamp_min(1)
+    
+    return avg_loss, avg_relative_error, relative_errors_bins.tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -615,8 +629,11 @@ for step in range(num_iterations):
 
     # --- Eval ---
     if step == 0 or last_step or (args.eval_every > 0 and step % args.eval_every == 0):
-        val_loss, val_relative_error = evaluate(dit, args.eval_steps)
-        print0(f"Step {step:06d} | Val FM loss: {val_loss:.6f} | Val relative FM error {val_relative_error:.6f}")
+        val_loss, val_relative_error, val_relative_error_bins = evaluate(dit, args.eval_steps)
+
+        val_relative_error_bins = [f"{e:.2f}" for e in val_relative_error_bins]
+
+        print0(f"Step {step:06d} | Val FM loss: {val_loss:.6f} | Val relative FM error {val_relative_error:.6f} ({' | '.join(val_relative_error_bins)})")
         wandb_run.log({"step": step, "val/fm_loss": val_loss, "val/fm_relative_error": val_relative_error})
 
     # --- Save ---
