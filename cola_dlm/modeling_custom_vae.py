@@ -85,14 +85,14 @@ class DiagonalGaussianDistribution:
                 self.mean, device=self.parameters.device, dtype=self.parameters.dtype
             )
 
-    def sample(self, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+    def sample(self, max_std: float = 1, generator: Optional[torch.Generator] = None) -> torch.Tensor:
         sample = torch.randn(
             self.mean.shape,
             generator=generator,
             device=self.parameters.device,
             dtype=self.parameters.dtype,
         )
-        return self.mean + self.std * sample
+        return self.mean + self.std.clamp_max(max_std) * sample
 
     def mode(self) -> torch.Tensor:
         return self.mean

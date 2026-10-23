@@ -391,14 +391,18 @@ def generate_task_repaint_inference(
         if patch_size > 1:
             prompt_len_remainders.append(len(ids) % patch_size)
 
-        p_pad_len = (chunk - len(ids) % chunk) % chunk
-        t_labels = [1] * len(ids) + [3] * p_pad_len
+        patch_pad_len = len(ids) % patch_size
+        block_pad_len = (chunk - len(ids) % chunk) % chunk - patch_pad_len
+
+        # TODO: add label 2 into partially padded latent?
+
+        t_labels = [1] * len(ids) + [2] * patch_pad_len + [3] * block_pad_len
         src_key_padding_mask = torch.cat([
             torch.zeros((len(ids),), dtype=torch.bool, device=device),
-            torch.ones((p_pad_len,), dtype=torch.bool, device=device)
+            torch.ones((patch_pad_len + block_pad_len,), dtype=torch.bool, device=device)
         ], dim=0)
 
-        ids = ids + [pad_token_id] * p_pad_len
+        ids = ids + [pad_token_id] * (patch_pad_len + block_pad_len)
 
         input_ids_list.append(torch.tensor(ids, dtype=torch.long, device=device))
         input_src_key_padding_masks.append(src_key_padding_mask)
@@ -416,27 +420,6 @@ def generate_task_repaint_inference(
         enc = vae.encode(input_ids_list, attention_masks)
         latents_list = [((lat - shift) * scale).float() for lat in enc.latents_list]
 
-        # print('raw prefix lens', [torch.sum(m).item() for m in attention_masks])
-        # print('pad lens', [len(m) - torch.sum(m).item() for m in attention_masks])
-
-        # decoded = vae.decode(
-        #     z=latents_list,
-        # )
-
-        # pseudo_mean_ce = torch.mean(torch.as_tensor([F.cross_entropy(d[m].permute(1, 0).unsqueeze(0), i[m].unsqueeze(0)) for d, i, m in zip(decoded, input_ids_list, attention_masks)]))
-        # print('pseudo_mean_ce', pseudo_mean_ce.item())
-
-        # decoded = vae.forward_with_a_list(input_ids_list, src_key_padding_masks_list=input_src_key_padding_masks, variance=False)
-        # pseudo_mean_ce = torch.mean(torch.as_tensor([F.cross_entropy(d[m].permute(1, 0).unsqueeze(0), i[m].unsqueeze(0)) for d, i, m in zip(decoded, input_ids_list, attention_masks)]))
-        # print('pseudo_mean_ce full forward', pseudo_mean_ce.item())
-
-        # decoded = list()
-        # for input_ids, src_key_padding_mask in zip(input_ids_list, input_src_key_padding_masks):
-        #     decoded_, _, _ = vae.forward(torch.as_tensor(input_ids).unsqueeze(0), src_key_padding_mask=src_key_padding_mask.unsqueeze(0))
-        #     decoded.append(decoded_)
-        # pseudo_mean_ce = torch.mean(torch.as_tensor([F.cross_entropy(d[:, m].permute(0, 2, 1), i[m].unsqueeze(0)) for d, i, m in zip(decoded, input_ids_list, attention_masks)]))
-        # print('pseudo_mean_ce regular forward', pseudo_mean_ce.item())
-
     # -----------------------------------------------------------------
     # Step 3: latent labels per sample + first-generation-block layout
     # -----------------------------------------------------------------
@@ -449,13 +432,14 @@ def generate_task_repaint_inference(
         c1 = (reshaped == 1).any(dim=1)
         c2 = (reshaped == 2).any(dim=1)
         lat = torch.full((n_patches,), 3, dtype=torch.long, device=device)
-        lat[c2] = 2
+        # SWAPPED THESE TWO: previously latent_label=1 was prioritized over latent_label=2
         lat[c1] = 1
+        lat[c2] = 2
         latent_labels_list.append(lat)
 
     # Strip trailing label-3 pad: NA form carries only real (label 1/2)
     # latents from this point on.
-    prompt_latent_counts: list[int] = [int((lat == 1).sum().item()) for lat in latent_labels_list]
+    prompt_latent_counts: list[int] = [int((lat != 3).sum().item()) for lat in latent_labels_list]
 
     prefix_list: list[torch.Tensor] = []
     first_block_latents_list: list[torch.Tensor] = []
@@ -533,14 +517,6 @@ def generate_task_repaint_inference(
                 use_kv_cache=True,
             )
         batched_prefix = prefix_list
-        # print('prefix lens', [len(e) for e in prefix_list])
-        # with torch.autocast("cuda", dtype=torch.bfloat16):
-        #     _ = vae.decode(
-        #         z=torch.cat(prefix_list, dim=0),
-        #         txt_shape=txt_shape_prefix,
-        #         txt_q_shape=txt_shape_prefix,
-        #         update_kv=True,
-        #     )
     else:
         batched_prefix = None
 

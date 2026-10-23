@@ -31,6 +31,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 import torch.distributed as dist
+from torch.nn import functional as F
 
 # ---------------------------------------------------------------------------
 # CLI arguments
@@ -63,7 +64,7 @@ parser.add_argument("--optimizer", type=str, default="adamw", choices=["muon", "
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="Muon LR for 2D params")
 parser.add_argument("--scalar-lr", type=float, default=0.3, help="AdamW LR for 1D/scalar params")
 parser.add_argument("--adamw-lr", type=float, default=1.5e-4, help="AdamW mode: peak LR")
-parser.add_argument("--adamw-warmup-steps", type=int, default=5000, help="AdamW mode: warmup steps")
+parser.add_argument("--adamw-warmup-steps", type=int, default=200, help="AdamW mode: warmup steps")
 parser.add_argument("--weight-decay", type=float, default=0.28, help="Muon weight decay (AdamW mode: 0.01)")
 parser.add_argument("--grad-clip", type=float, default=0.0,
                     help="Gradient norm clip (0 = disabled). Muon default: 0. AdamW default: 1.0.")
@@ -91,6 +92,9 @@ parser.add_argument("--data-dir", type=str, default="cache_nanochat/base_data_cl
 # Attention backend
 parser.add_argument("--attn-backend", type=str, default="naive", choices=["naive", "sdpa", "flex"],
                     help="Attention backend: 'naive' (manual matmul), 'sdpa' (PyTorch SDPA), 'flex' (FlexAttention)")
+parser.add_argument("--max-padded-tail-len", type=int, default=0)
+parser.add_argument("--vae-sample-max-std-context", type=float, default=1)
+parser.add_argument("--vae-sample-max-std-target", type=float, default=1)
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -181,6 +185,7 @@ num_params = sum(p.numel() for p in dit.parameters())
 print0(f"DiT: {num_params:,} params (random init), block_size={default_block_size}")
 print0(f"Training block sizes: {dict(zip(BLOCK_SIZES, BLOCK_SIZE_PROBS))}")
 print0(f"VAE: {sum(p.numel() for p in vae.parameters()):,} params (frozen)")
+print0(f"VAE mode: {args.vae_mode} ({args.vae_sample_max_std_context:.2f}, {args.vae_sample_max_std_target:.2f})")
 
 # ---------------------------------------------------------------------------
 # Batch size and training horizon auto-computation
@@ -358,12 +363,12 @@ def sample_block_size():
 # ---------------------------------------------------------------------------
 # Noisy copy construction
 # ---------------------------------------------------------------------------
-def build_noisy_sample_pretrain(z_0, t_val, z_1, sample_block_size, unpadded_len=None):
-    L = z_0.shape[0]
-    z_noisy = (1 - t_val) * z_0 + t_val * z_1
-    loss_mask = torch.ones(L, device=z_0.device)
-    ts_noisy = torch.full((L,), t_val * T, device=z_0.device)
-    target = z_1 - z_0
+def build_noisy_sample_pretrain(z_0_context, z_0_target, t_val, z_1, sample_block_size, unpadded_len=None):
+    L = z_0_context.shape[0]
+    z_noisy = (1 - t_val) * z_0_context + t_val * z_1
+    loss_mask = torch.ones(L, device=z_0_context.device)
+    ts_noisy = torch.full((L,), t_val * T, device=z_0_context.device)
+    target = z_1 - z_0_target
 
     if unpadded_len is not None and unpadded_len < L:
         loss_mask[unpadded_len:] = 0.0
@@ -377,7 +382,7 @@ def build_noisy_sample_pretrain(z_0, t_val, z_1, sample_block_size, unpadded_len
             if random.random() < args.prompt_block_prob:
                 split = random.randint(1, blk_len - 1)
                 s = slice(blk_start, blk_start + split)
-                z_noisy[s] = z_0[s]
+                z_noisy[s] = z_0_context[s]
                 ts_noisy[s] = 0.0
                 loss_mask[s] = 0.0
 
@@ -397,37 +402,45 @@ def sample_timestep(batch_size):
 # ---------------------------------------------------------------------------
 # Prepare batch
 # ---------------------------------------------------------------------------
-def prepare_batch(inputs):
+def prepare_batch(inputs, max_padded_tail_len=16):
     B = inputs.shape[0]
 
     batch = []
     for i in range(B):
         bs = sample_block_size() * vae.sequence_compression_ratio
         token_row = inputs[i]
-        L = token_row.shape[0] // vae.sequence_compression_ratio
-        pad_len = (bs - L % bs) % bs
-        if pad_len > 0:
-            token_row = torch.cat([
-                token_row,
-                torch.full((pad_len,), PAD_TOKEN_ID, device=device, dtype=torch.long),
-            ])
-        # with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        #     enc = vae.encode([token_row])
-        # if args.vae_mode == "sample" and enc.latent_dists is not None:
-        #     z_0 = enc.latent_dists[0].sample().float()
-        # else:
-        #     z_0 = enc.latents_list[0].float()
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            enc = vae.encode(list(token_row.split(bs)))
-        if args.vae_mode == 'sample' and enc.latent_dists is not None:
-            z_0 = torch.cat([e.sample().float() for e in enc.latent_dists], dim=0)
+        L = token_row.shape[0]
+
+        if max_padded_tail_len > 0:
+            num_blocks = int(L // bs) + (L % bs != 0)
+            block_paddings = torch.randint(0, max_padded_tail_len, (num_blocks,))
+            token_row = token_row[block_paddings.sum():]
+
+            blocks = torch.full((num_blocks, bs), fill_value=PAD_TOKEN_ID, dtype=torch.long, device=device)
+            last_idx = 0
+            for i, block_padding in enumerate(block_paddings):
+                non_padding_tokens = bs - block_padding
+                blocks[i, :non_padding_tokens] = token_row[last_idx: last_idx + non_padding_tokens]
+
+                last_idx += non_padding_tokens
+
         else:
-            z_0 = torch.cat([e.float() for e in enc.latent_list], dim=0)
+            pad_len = (bs - L % bs) % bs
+            blocks = list(F.pad(token_row, (0, pad_len), value=PAD_TOKEN_ID).split(bs))
 
-        z_0 = (z_0 - vae.shifting_factor) * vae.scaling_factor
-        batch.append((z_0, z_0.shape[0], bs, L))
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            enc = vae.encode(blocks)
+        if args.vae_mode == 'sample' and enc.latent_dists is not None:
+            z_0_context = torch.cat([e.sample(args.vae_sample_max_std_context).float() for e in enc.latent_dists], dim=0)
+            z_0_target = torch.cat([e.sample(args.vae_sample_max_std_target).float() for e in enc.latent_dists], dim=0)
+        else:
+            z_0_context = torch.cat([e.float() for e in enc.latents_list], dim=0)
+            z_0_target = torch.cat([e.float() for e in enc.latents_list], dim=0)
+
+        z_0_context = (z_0_context - vae.shifting_factor) * vae.scaling_factor
+        z_0_target = (z_0_target - vae.shifting_factor) * vae.scaling_factor
+        batch.append((z_0_context, z_0_target, z_0_context.shape[0], bs, L))
     return batch
-
 
 # ---------------------------------------------------------------------------
 # Flow matching step
@@ -447,19 +460,19 @@ def flow_matching_step(dit_model, batch):
 
     noisy_first = (attn_backend == "flex")
 
-    for i, (z_0, L, bs, unpadded_len) in enumerate(batch):
-        z_1 = torch.randn_like(z_0)
+    for i, (z_0_context, z_0_target, L, bs, unpadded_len) in enumerate(batch):
+        z_1 = torch.randn_like(z_0_context)
         z_noisy, loss_mask, target_vel, ts_noisy = build_noisy_sample_pretrain(
-            z_0, t[i].item(), z_1, bs, unpadded_len=unpadded_len,
+            z_0_context, z_0_target, t[i].item(), z_1, bs, unpadded_len=unpadded_len,
         )
 
         if noisy_first:
             # Fast-dLLM v2 layout: [xt(noisy) | x0(clean)]
-            extended_list.append(torch.cat([z_noisy, z_0.detach()], dim=0))
+            extended_list.append(torch.cat([z_noisy, z_0_context.detach()], dim=0))
             ts_list.append(torch.cat([ts_noisy, torch.zeros(L, device=device)]))
         else:
             # Cola layout: [x0(clean) | xt(noisy)]
-            extended_list.append(torch.cat([z_0.detach(), z_noisy], dim=0))
+            extended_list.append(torch.cat([z_0_context.detach(), z_noisy], dim=0))
             ts_list.append(torch.cat([torch.zeros(L, device=device), ts_noisy]))
 
         target_list.append(target_vel)
@@ -515,18 +528,20 @@ def flow_matching_step(dit_model, batch):
             pred_list.append(sample_out[sl:])   # Cola: noisy is second half
         offset += 2 * sl
 
-    pred = torch.cat(pred_list, dim=0).float()
-    target = torch.cat(target_list, dim=0)
-    loss_mask = torch.cat(mask_list, dim=0)
+    pred = torch.stack(pred_list, dim=0).float()
+    target = torch.stack(target_list, dim=0)
+    loss_mask = torch.stack(mask_list, dim=0)
 
     error = ((pred - target) ** 2).mean(dim=-1)
     num_masked = loss_mask.sum().clamp(min=1.0)
     loss = (error * loss_mask).sum() / num_masked
 
     target_energy = target.square().mean(dim=-1)
-    relative_error = ((error * loss_mask).sum() / (target_energy * loss_mask).sum().clamp_min(1e-8))
+    # relative_error = ((error * loss_mask).sum() / (target_energy * loss_mask).sum().clamp_min(1e-8))
 
-    return loss, relative_error
+    relative_errors = ((error * loss_mask).sum(-1) / (target_energy * loss_mask).sum(-1).clamp_min(1e-8))
+
+    return loss, relative_errors, t
 
 
 # ---------------------------------------------------------------------------
@@ -539,8 +554,10 @@ def evaluate(dit_model, eval_steps):
     relative_errors = []
     for _ in range(eval_steps):
         inputs, _, _ = next(val_loader)
-        batch = prepare_batch(inputs)
-        loss, relative_error = flow_matching_step(dit_model, batch)
+        batch = prepare_batch(inputs, 0)
+
+        loss, relative_errors_, ts = flow_matching_step(dit_model, batch)
+        relative_error = relative_errors_.mean()
         losses.append(loss.item())
         relative_errors.append(relative_error.item())
     dit_model.train()
@@ -590,6 +607,8 @@ smooth_relative_error = 0.0
 ema_beta = 0.95
 val_loss = float("nan")
 
+train_relative_errors = [list() for _ in range(10)]
+
 for step in range(num_iterations):
     t0 = time.time()
     last_step = step == num_iterations - 1
@@ -615,11 +634,15 @@ for step in range(num_iterations):
             ctx = nullcontext() if is_last_micro else dit.no_sync()
         with ctx:
             inputs, _, _ = next(train_loader)
-            batch = prepare_batch(inputs)
-            loss, relative_error = flow_matching_step(dit, batch)
+            batch = prepare_batch(inputs, args.max_padded_tail_len)
+            loss, relative_errors, ts = flow_matching_step(dit, batch)
+            relative_error = relative_errors.mean()
             train_loss += loss.detach() / grad_accum_steps
             train_relative_error += relative_error.detach() / grad_accum_steps
             (loss / grad_accum_steps).backward()
+
+            for re, t in zip(relative_errors, ts):
+                train_relative_errors[int(t * 10)].append(re.item())
 
     # LR update
     lrm = get_lr_multiplier(step)
@@ -628,6 +651,8 @@ for step in range(num_iterations):
         if use_muon and group.get("kind") == "muon":
             group["momentum"] = get_muon_momentum(step)
             group["weight_decay"] = get_weight_decay_schedule(step)
+
+    grad_norm = torch.nn.utils.get_total_norm((orig_dit if ddp_world_size > 1 else dit).parameters()).item()
 
     # Gradient clipping
     if args.grad_clip > 0:
@@ -662,9 +687,14 @@ for step in range(num_iterations):
     debiased_relative = smooth_relative_error / (1 - ema_beta ** (step + 1))
 
     if step % 10 == 0 or last_step:
+        train_relative_errors = [sum(e) / len(e) if len(e) > 0 else 0 for e in train_relative_errors]
+        train_relative_errors = [f"{e:.2f}" for e in train_relative_errors]
+
         free, total = torch.cuda.mem_get_info(device)
         mem_used_MB = round((total - free) / 1024 ** 2)
-        print0(f"step {step:06d} | loss: {debiased:.6f} | relative_error: {debiased_relative:.6f} | lr_mul: {lrm:.4f} | dt: {dt * 1000:.0f}ms | mem usage (MB): {mem_used_MB}")
+        print0(f"step {step:06d} | loss: {debiased:.6f} | grad_norm: {grad_norm:.4f} | relative_error: {debiased_relative:.6f} ({' | '.join(train_relative_errors)}) | lr_mul: {lrm:.4f} | dt: {dt * 1000:.0f}ms | mem usage (MB): {mem_used_MB}")
+
+        train_relative_errors = [list() for _ in range(10)]
 
     wandb_run.log({
         "step": step,

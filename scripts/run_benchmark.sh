@@ -38,12 +38,16 @@ DIT_PATH="${DIT_PATH:-${REPO_DIR}/hf_models/cola_dlm/cola_dit}"
 VAE_PATH="${VAE_PATH:-${REPO_DIR}/hf_models/cola_dlm/cola_vae}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/eval_output/tasks_default}"
 
-VAE_TYPE="${VAE_TYPE:-causal}"
+INF_TYPE="${INF_TYPE:-causal}"
 
-if [ "$VAE_TYPE" == "causal" ]; then
+if [ "$INF_TYPE" == "causal" ]; then
     INFERENCE_COMMAND="cola_dlm.inference"
-else
+elif [ "$INF_TYPE" == "bidirectional_vae" ]; then
     INFERENCE_COMMAND="cola_dlm.inference_bidirectional_vae"
+elif [ "$INF_TYPE" == "bidirectional_vae_and_dit" ]; then
+    INFERENCE_COMMAND="cola_dlm.inference_bidirectional_dit"
+else
+    exit 128
 fi
 
 echo $INFERENCE_COMMAND
