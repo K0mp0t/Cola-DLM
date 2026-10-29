@@ -65,6 +65,7 @@ from torch import nn
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 
 from .configuration_custom_vae import CustomTextVAEConfig
+from .mergers import *
 
 # ---------------------------------------------------------------------------
 # DiagonalGaussianDistribution
@@ -303,63 +304,7 @@ class CustomTransformerEncoderLayer(nn.Module):
         if self.linear3 is not None:
             src = self.linear3(src)
         src = src + self.dropout2(src2)
-        return src
-
-
-# ---------------------------------------------------------------------------
-# Merger and unmerger
-# ---------------------------------------------------------------------------
-
-
-class MLPPatchMerger(nn.Module):
-    def __init__(self, merge_ratio, hidden_size):
-        super().__init__()
-
-        self.hidden_size = hidden_size
-        self.merge_ratio = merge_ratio
-
-        if self.merge_ratio != 1:
-            self.linear = nn.Linear(hidden_size*merge_ratio, hidden_size)
-
-    def forward(self, x, attention_mask=None):
-        if self.merge_ratio == 1:
-            return x, attention_mask
-
-        if attention_mask is not None:
-            attention_mask = attention_mask.view(x.shape[0], self.merge_ratio, -1)
-            attention_mask = torch.sum(attention_mask, dim=1, dtype=torch.bool)
-
-        if x.shape[1] % self.merge_ratio != 0:
-            x = F.pad(x, (0, 0, 0, self.merge_ratio - x.shape[1] % self.merge_ratio), value=0)
-
-        x = x.view(x.shape[0], -1, self.merge_ratio, x.shape[-1])        
-        x = x.view(x.shape[0], -1, self.merge_ratio * x.shape[-1])
-
-        x = self.linear(x)
-
-        return x, attention_mask
-
-
-class MLPPatchUnMerger(nn.Module):
-    def __init__(self, merge_ratio, hidden_size):
-        super().__init__()
-
-        self.hidden_size = hidden_size
-        self.merge_ratio = merge_ratio
-
-        if self.merge_ratio != 1:
-            self.linear = nn.Linear(hidden_size, hidden_size*merge_ratio)
-
-    def forward(self, x):
-        if self.merge_ratio == 1:
-            return x
-
-        x = self.linear(x)
-
-        x = x.view(x.shape[0], x.shape[1], self.merge_ratio, -1)
-        x = x.view(x.shape[0], x.shape[1] * self.merge_ratio, -1)
-
-        return x        
+        return src  
 
 
 # ---------------------------------------------------------------------------
@@ -402,34 +347,41 @@ class CustomTextVAEModel(PreTrainedModel):
         else:
             raise ValueError(f'unsupported norm type {config.layer_norm_type}')
 
-        self.input_embedding = nn.Embedding(self.vocab_size, self.compression_config[0][1])
-
-        self.encoder_blocks = nn.ModuleList([
-            CustomTransformerEncoderLayer(input_size, num_heads=self.num_heads, dim_feedforward=input_size*4, output_size=output_size, 
-            dropout=self.dropout, activation=self.act, layer_norm_type=self.layer_norm_type, layer_norm_eps=self.layer_norm_eps, rope_theta=self.rope_theta)
-            for _, input_size, output_size in self.compression_config
-        ])
-
-        self.encoder_mergers = nn.ModuleList([
-            MLPPatchMerger(merge_ratio, output_size) for merge_ratio, _, output_size in self.compression_config
-        ])
+        self.input_embedding = nn.Embedding(self.vocab_size, self.compression_config[0].input_size)
 
         self.mu_proj = nn.Linear(self.latent_dim, self.latent_dim)
         self.sigma_proj = nn.Linear(self.latent_dim, self.latent_dim)
 
-        self.decoder_blocks = nn.ModuleList([
-            CustomTransformerEncoderLayer(input_size, num_heads=8, dim_feedforward=input_size*4, output_size=output_size, 
-            dropout=self.dropout, activation=self.act, layer_norm_type=self.layer_norm_type, layer_norm_eps=self.layer_norm_eps, rope_theta=self.rope_theta)
-            for _, output_size, input_size in self.compression_config[::-1]
-        ])
+        encoder_blocks = list()
+        decoder_blocks = list()
 
-        self.decoder_unmergers = nn.ModuleList([
-            MLPPatchUnMerger(merge_ratio, output_size) for merge_ratio, _, output_size in self.compression_config[::-1]
-        ])
+        encoder_mergers = list()
+        decoder_unmergers = list()
 
-        self.sequence_compression_ratio = math.prod(cr for cr, _, _ in self.compression_config)
+        for item in self.compression_config:
+            encoder_blocks.append(
+                CustomTransformerEncoderLayer(item.input_size, num_heads=self.num_heads, dim_feedforward=item.input_size*4, output_size=item.output_size, 
+                dropout=self.dropout, activation=self.act, layer_norm_type=self.layer_norm_type, layer_norm_eps=self.layer_norm_eps, rope_theta=self.rope_theta)
+            )
+            encoder_mergers.append(CustomTextVAEConfig.allowed_mergers[item.merger_name][0](item.merge_ratio, item.output_size, item.merge_window_width))
 
-        self.output_proj = nn.Linear(self.compression_config[0][1], self.vocab_size)
+            decoder_blocks.append(
+                CustomTransformerEncoderLayer(item.output_size, num_heads=self.num_heads, dim_feedforward=item.output_size*4, output_size=item.input_size, 
+                dropout=self.dropout, activation=self.act, layer_norm_type=self.layer_norm_type, layer_norm_eps=self.layer_norm_eps, rope_theta=self.rope_theta)
+            )
+
+            decoder_unmergers.append(
+                CustomTextVAEConfig.allowed_mergers[item.unmerger_name][1](item.merge_ratio, item.output_size, item.unmerge_window_width)
+            )
+
+        self.encoder_blocks = nn.ModuleList(encoder_blocks)
+        self.decoder_blocks = nn.ModuleList(decoder_blocks[::-1])
+        self.encoder_mergers = nn.ModuleList(encoder_mergers)
+        self.decoder_unmergers = nn.ModuleList(decoder_unmergers[::-1])
+
+        self.sequence_compression_ratio = math.prod(e.merge_ratio for e in self.compression_config)
+
+        self.output_proj = nn.Linear(self.compression_config[0].input_size, self.vocab_size)
 
         self.post_init()
 
