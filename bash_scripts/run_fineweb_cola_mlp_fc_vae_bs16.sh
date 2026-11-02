@@ -8,14 +8,15 @@ torchrun \
     --rdzv-backend=c10d \
     ../scripts/cola_pretrain_custom_bidirectional_vae.py \
     -- \
-    --dit-heads 12 \
+    --dit-heads 8 \
+    --vae-path ../hf_models/custom_mlp_fc_vae_fineweb \
     --data-dir /scratch/users/k25137033/dlms/languageVAE/data/fineweb \
-    --vae-path ./hf_models/custom_sc_vae_fineweb \
     --attn-backend sdpa \
-    --optimizer muon \
-    --run="fineweb_cola_smallscale_context_independent_encoding" \
-    --device-batch-size 4 \
-    --total-batch-size 500000 \
+    --optimizer adamw \
+    --run="fineweb_custom_mlp_fc_vae_bs16" \
+    --device-batch-size 32 \
     --dit-block-size 16 \
-    --max-seq-len 1024 \
-    --target-param-data-ratio 12
+    --total-batch-size 524288 \
+    --vae-sample-max-std-context 1.0 \
+    --vae-sample-max-std-target 1.0 \
+    --max-padded-tail-len 0

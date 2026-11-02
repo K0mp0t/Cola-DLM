@@ -363,6 +363,7 @@ def generate_task_repaint_inference(
     batch_prompts_text: list[str] = []
     input_ids_list: list[torch.Tensor] = []
     input_src_key_padding_masks: list[torch.Tensor] = []
+    prompt_prefix_pad_lens: list[int] = []
     token_labels_list: list[torch.Tensor] = []
     prompt_len_remainders: list[int] = []
 
@@ -391,21 +392,26 @@ def generate_task_repaint_inference(
         if patch_size > 1:
             prompt_len_remainders.append(len(ids) % patch_size)
 
-        patch_pad_len = len(ids) % patch_size
+        if len(ids) % patch_size != 0:
+            patch_pad_len = patch_size - (len(ids) % patch_size)
+        else:
+            patch_pad_len = 0
         block_pad_len = (chunk - len(ids) % chunk) % chunk - patch_pad_len
 
-        # TODO: add label 2 into partially padded latent?
-
-        t_labels = [1] * len(ids) + [2] * patch_pad_len + [3] * block_pad_len
+        t_labels = [3] * patch_pad_len + [1] * len(ids) + [3] * block_pad_len
         src_key_padding_mask = torch.cat([
+            torch.ones((patch_pad_len,), dtype=torch.bool, device=device),
             torch.zeros((len(ids),), dtype=torch.bool, device=device),
-            torch.ones((patch_pad_len + block_pad_len,), dtype=torch.bool, device=device)
-        ], dim=0)
+            torch.ones((block_pad_len,), dtype=torch.bool, device=device)
+        ], dim=0).unsqueeze(0).unsqueeze(0).repeat(1, len(t_labels), 1)
 
-        ids = ids + [pad_token_id] * (patch_pad_len + block_pad_len)
+        # print(len(ids), patch_pad_len, block_pad_len)
+
+        ids = [pad_token_id] * patch_pad_len + ids + [pad_token_id] * block_pad_len
 
         input_ids_list.append(torch.tensor(ids, dtype=torch.long, device=device))
         input_src_key_padding_masks.append(src_key_padding_mask)
+        prompt_prefix_pad_lens.append(patch_pad_len)
         token_labels_list.append(torch.tensor(t_labels, dtype=torch.long, device=device))
 
     batch_size = len(input_ids_list)
@@ -432,14 +438,13 @@ def generate_task_repaint_inference(
         c1 = (reshaped == 1).any(dim=1)
         c2 = (reshaped == 2).any(dim=1)
         lat = torch.full((n_patches,), 3, dtype=torch.long, device=device)
-        # SWAPPED THESE TWO: previously latent_label=1 was prioritized over latent_label=2
-        lat[c1] = 1
         lat[c2] = 2
+        lat[c1] = 1
         latent_labels_list.append(lat)
 
     # Strip trailing label-3 pad: NA form carries only real (label 1/2)
     # latents from this point on.
-    prompt_latent_counts: list[int] = [int((lat != 3).sum().item()) for lat in latent_labels_list]
+    prompt_latent_counts: list[int] = [int((lat == 1).sum().item()) for lat in latent_labels_list]
 
     prefix_list: list[torch.Tensor] = []
     first_block_latents_list: list[torch.Tensor] = []
@@ -485,6 +490,8 @@ def generate_task_repaint_inference(
             prefix_list.append(latents_list[i][:num_ones].clone())
             first_block_latents_list.append(pad_placeholder)
             first_block_labels_list.append(torch.full((block_size,), 2, dtype=torch.long, device=device))
+
+        # print('prefix:', prefix_list[-1].shape, 'first_block_latents:', first_block_latents_list[-1].shape, 'first_block_labels', first_block_labels_list[-1])
 
     # -----------------------------------------------------------------
     # Step 4: prefix KV prefetch (DiT + VAE decoder), NA form
@@ -660,12 +667,12 @@ def generate_task_repaint_inference(
         # ------------ decode one block via VAE (NA) ----------------
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if batched_prefix is not None:
-                # print('batched_prefix is not None', [len(e) for e in batched_prefix])
                 batched_prefix = [torch.cat([p, c], dim=0) for p, c in zip(batched_prefix, txt.view(batch_size, block_size, latent_dim))]
-                # print('batched_prefix is not None', [len(e) for e in batched_prefix])
             else:
-                batched_prefix = txt.view(batch_size, block_size, latent_dim)   
-                # print('batched_prefix is None', [len(e) for e in batched_prefix])            
+                batched_prefix = txt.view(batch_size, block_size, latent_dim)
+
+            # print('vae decoding', [e.shape for e in batched_prefix])
+
             decoded = vae.decode(
                 z=batched_prefix,
             )
@@ -687,12 +694,12 @@ def generate_task_repaint_inference(
             repetition_penalty=repetition_penalty,
         )
 
-        # if context_ids is None:
-        #     context_ids = one_block_ids
-        # else:
-        #     context_ids = torch.cat([context_ids, one_block_ids], dim=1)
+        if context_ids is None:
+            context_ids = one_block_ids
+        else:
+            context_ids = torch.cat([context_ids, one_block_ids], dim=1)
 
-        context_ids = one_block_ids
+        # context_ids = one_block_ids
 
         for b in range(one_block_ids.shape[0]):
             if eos_token_id is not None and eos_token_id in one_block_ids[b]:
@@ -728,16 +735,16 @@ def generate_task_repaint_inference(
     # -----------------------------------------------------------------
     context_ids_cpu = context_ids.detach().cpu()
     prompt_trim_counts = first_block_prompt_token_counts.detach().cpu().tolist()
+
+    # print(prompt_trim_counts, prefix_lens, prompt_prefix_pad_lens)
+
     trimmed_ids = []
     for sample_idx, trim_count in enumerate(prompt_trim_counts):
-        trim_count += prefix_lens[sample_idx] * patch_size
+        trim_count += prefix_lens[sample_idx] * patch_size + prompt_prefix_pad_lens[sample_idx]
         trim_count = max(0, min(int(trim_count), context_ids_cpu.shape[1]))
         trimmed_ids.append(context_ids_cpu[sample_idx, trim_count:].tolist())
     generated_texts = tokenizer.decode_batch(trimmed_ids, skip_special_tokens=False)
-    generated_texts_full = tokenizer.decode_batch([e.tolist() for e in context_ids_cpu], skip_special_tokens=False)
-
-    # print('trim_counts:', prompt_trim_counts, prefix_lens, [i + j * patch_size for i, j in zip(prompt_trim_counts, prefix_lens)])
-    # print('decoded_ids size', [len(e) for e in generated_texts])
+    generated_texts_full = tokenizer.decode_batch([e[pad_prefix_len:].tolist() for e, pad_prefix_len in zip(context_ids_cpu, prompt_prefix_pad_lens)], skip_special_tokens=False)
 
     results: list[dict] = []
     for idx, gen_text in enumerate(generated_texts):
@@ -815,13 +822,13 @@ def main():
         choices=dummy_data.get("choices", None),
     )
     ids = tokenizer.encode(prompt_str).ids
-    chunk_size = 16
-    p_pad_len = 16 - len(ids) % 16
+    chunk_size = 128
+    p_pad_len = chunk_size - len(ids) % chunk_size
 
     src_key_padding_mask = torch.cat([
         torch.zeros((len(ids),), dtype=torch.bool, device=device),
         torch.ones((p_pad_len,), dtype=torch.bool, device=device)
-    ], dim=0).unsqueeze(0).to(device)
+    ], dim=0).unsqueeze(0).unsqueeze(0).unsqueeze(0).repeat(1, 1, len(ids) + p_pad_len, 1).to(device)
 
     ids = torch.as_tensor(ids + [100277] * p_pad_len).unsqueeze(0).to(device)
 

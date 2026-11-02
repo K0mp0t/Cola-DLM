@@ -341,17 +341,32 @@ class PerceiverResamplerMerger(nn.Module):
         # x: (B, L, E), where L might be more than merge_window_size
         # attention_mask: (B, 1, L, L) a mix of padding mask and causal mask
         # attention_mask shound be (B * L / l, 1, M, l) where M - number of learnable latents and l is merge_window_size
-
-        # I had no opportunity to debug this, tho it looks correct
         B, L, H = x.shape
 
-        if attention_mask is not None:
-            attention_mask = torch.cat([attention_mask[..., i * self.merge_window_width: (i + 1) * self.merge_window_width, i * self.merge_window_width: (i + 1) * self.merge_window_width] 
-                for i in range(L // self.merge_window_width + (L % self.merge_window_width != 0))])
+        # padding shouldn't be added here
 
-            attention_mask = attention_mask[:, :, -1].unsqueeze(2).repeat(1, 1, self.merge_window_width // self.merge_ratio, 1)
+        if L % self.merge_window_width != 0:
+            pad_len = self.merge_window_width - (L % self.merge_window_width)
+
+            x = F.pad(x, (0, 0, 0, pad_len), value=0)
+            attention_mask = F.pad(attention_mask, (0, pad_len, 0, pad_len), value=0)
+
+            L += pad_len
+
+        if attention_mask is not None:
+            window_masks = [attention_mask[..., i * self.merge_window_width: (i + 1) * self.merge_window_width, i * self.merge_window_width: (i + 1) * self.merge_window_width] 
+                for i in range(L // self.merge_window_width + (L % self.merge_window_width != 0))]
+
+            attention_mask = torch.stack(window_masks, dim=1).flatten(0, 1)
+            
+            # if we added padding before, we need two know which elements are pads
+            # attention_mask = attention_mask[:, :, -1]
+
+            attention_mask = attention_mask.sum(dim=2) != 0
+            attention_mask = attention_mask.unsqueeze(2).repeat(1, 1, self.merge_window_width // self.merge_ratio, 1)
 
         x = x.reshape(-1, self.merge_window_width, H)
+
         x = self.local_attn(self.learnable_latents.repeat(x.shape[0], 1, 1), x, x, attention_mask)
 
         x = x.reshape(B, L // self.merge_ratio, H)

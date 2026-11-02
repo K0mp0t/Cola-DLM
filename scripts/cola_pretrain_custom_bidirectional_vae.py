@@ -426,10 +426,12 @@ def prepare_batch(inputs, max_padded_tail_len=16):
 
         else:
             pad_len = (bs - L % bs) % bs
-            blocks = list(F.pad(token_row, (0, pad_len), value=PAD_TOKEN_ID).split(bs))
+            blocks = [F.pad(token_row, (0, pad_len), value=PAD_TOKEN_ID)]
+            causal_attn_mask = torch.ones((1, L+pad_len, L+pad_len), device=device, dtype=torch.bool).tril()
+            causal_attn_mask[:, :, -pad_len: -pad_len] = 0
 
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            enc = vae.encode(blocks)
+            enc = vae.encode(blocks, [causal_attn_mask])
         if args.vae_mode == 'sample' and enc.latent_dists is not None:
             z_0_context = torch.cat([e.sample(args.vae_sample_max_std_context).float() for e in enc.latent_dists], dim=0)
             z_0_target = torch.cat([e.sample(args.vae_sample_max_std_target).float() for e in enc.latent_dists], dim=0)
