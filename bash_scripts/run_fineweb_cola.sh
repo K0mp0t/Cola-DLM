@@ -11,10 +11,10 @@ torchrun \
     -- \
     --data-dir /scratch/users/k25137033/dlms/languageVAE/data/fineweb \
     --attn-backend sdpa \
-    --optimizer muon \
-    --run="fineweb_default_cola_smallscale" \
-    --device-batch-size 4 \
+    --optimizer adamw \
+    --dit-heads 8 \
+    --run="fineweb_default_cola_04b" \
+    --device-batch-size 16 \
     --total-batch-size 524288 \
-    --target-param-data-ratio 12 \
-    # --num-iterations 15000
+    --target-param-data-ratio 12 
 

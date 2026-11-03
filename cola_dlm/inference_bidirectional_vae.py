@@ -310,42 +310,6 @@ def generate_task_repaint_inference(
     assistant_token_id: Optional[int] = None,
     newline_token_id: Optional[int] = None,
 ) -> list[dict]:
-    """End-to-end Cola DLM inference (Eq. 2.2.4–2.2.6 of the paper).
-
-    Realizes the three-step inference algorithm of *Continuous Latent
-    Diffusion Language Model* (arXiv:2605.06548) for a batch of
-    prompts:
-
-    1. **Prefix encode** ``z^pre ~ q_phi(z^pre | x^pre)`` via
-       :meth:`ColaTextVAEModel.encode` (Eq. 2.2.4). The prefix latent is
-       written into the per-layer KV cache of both the DiT prior and
-       the VAE decoder so subsequent block-wise calls only pay
-       attention over the newly added Q.
-    2. **Block-wise latent prior transport** ``hat z_0^(b) =
-       Phi^psi_{0<-1}(eps^(b); z^pre, hat z_0^(<b))`` (Eq. 2.2.5),
-       implemented as a loop over generation blocks
-       ``b = 1, 2, ..., B``. For each block we draw
-       ``eps^(b) ~ N(0, I)``, then integrate the DiT vector field
-       ``v_psi`` from ``t = T`` to ``t = 0`` along ``timesteps`` with an
-       Euler-style update ``z_{t-Δ} = z_t - Δ/T * v_psi(...)`` and a
-       conditional / unconditional CFG combination. The cleaned block
-       is then committed to the prior + decoder KV cache.
-    3. **Conditional decode** ``hat x^res ~ p_theta(x^res | z^pre,
-       hat z_0^(1:B))`` (Eq. 2.2.6) via :meth:`ColaTextVAEModel.decode`,
-       producing token logits one block at a time. Logits are sampled
-       with the configured strategy (greedy / top-k / top-p /
-       repetition penalty) and appended to each sample's output buffer
-       until EOS or the ``max_new_tokens`` budget is hit.
-
-    The whole pipeline (DiT prior + VAE encoder + VAE decoder) runs in
-    NA / flatten-concat form: no ``max_len`` padding and therefore no
-    ``rope_pad_offset`` or padding-block attention mask bookkeeping. The
-    only practical detail layered on top of the paper's algorithm is a
-    per-sample CFG fallback for prompts shorter than ``block_size``
-    (whose first generation block has an empty prefix and would
-    otherwise just amplify bf16 kernel noise); see the comment block in
-    the loop body for details.
-    """
     dit.eval()
     vae.eval()
 
@@ -685,26 +649,26 @@ def generate_task_repaint_inference(
         pad_ohe[0, pad_token_id] = 1
         decoded_logits = torch.stack([torch.cat([d, pad_ohe.repeat(max_len-d.shape[0], 1)], dim=0) for d in decoded], dim=0)
 
-        one_block_ids = sample_with_strategies(
+        context_ids = sample_with_strategies(
             decoded_logits,
-            generated_ids=context_ids,
+            generated_ids=None,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
         )
 
-        if context_ids is None:
-            context_ids = one_block_ids
-        else:
-            context_ids = torch.cat([context_ids, one_block_ids], dim=1)
+        # if context_ids is None:
+        #     context_ids = one_block_ids
+        # else:
+        #     context_ids = torch.cat([context_ids, one_block_ids], dim=1)
 
         # context_ids = one_block_ids
 
-        for b in range(one_block_ids.shape[0]):
-            if eos_token_id is not None and eos_token_id in one_block_ids[b]:
+        for b in range(context_ids.shape[0]):
+            if eos_token_id is not None and eos_token_id in context_ids[b]:
                 eos_status[b] = True
-            if im_end_token_id is not None and im_end_token_id in one_block_ids[b]:
+            if im_end_token_id is not None and im_end_token_id in context_ids[b]:
                 eos_status[b] = True
         if eos_status.all():
             stop_flag = True
@@ -733,16 +697,31 @@ def generate_task_repaint_inference(
     # -----------------------------------------------------------------
     # Step 6: trim the leading prompt slice out of each sample's output
     # -----------------------------------------------------------------
+    # context_ids_cpu = context_ids.detach().cpu()
+    # prompt_trim_counts = first_block_prompt_token_counts.detach().cpu().tolist()
+
+    # # print(prompt_trim_counts, prefix_lens, prompt_prefix_pad_lens)
+
+    # trimmed_ids = []
+    # for sample_idx, trim_count in enumerate(prompt_trim_counts):
+    #     trim_count += prefix_lens[sample_idx] * patch_size + prompt_prefix_pad_lens[sample_idx]
+    #     trim_count = max(0, min(int(trim_count), context_ids_cpu.shape[1]))
+    #     trimmed_ids.append(context_ids_cpu[sample_idx, trim_count:].tolist())
+    # generated_texts = tokenizer.decode_batch(trimmed_ids, skip_special_tokens=False)
+    # generated_texts_full = tokenizer.decode_batch([e[pad_prefix_len:].tolist() for e, pad_prefix_len in zip(context_ids_cpu, prompt_prefix_pad_lens)], skip_special_tokens=False)
+
+
     context_ids_cpu = context_ids.detach().cpu()
     prompt_trim_counts = first_block_prompt_token_counts.detach().cpu().tolist()
 
-    # print(prompt_trim_counts, prefix_lens, prompt_prefix_pad_lens)
-
     trimmed_ids = []
-    for sample_idx, trim_count in enumerate(prompt_trim_counts):
-        trim_count += prefix_lens[sample_idx] * patch_size + prompt_prefix_pad_lens[sample_idx]
+
+    for sample_idx, first_block_prompt_count in enumerate(prompt_trim_counts):
+        trim_count = (prefix_lens[sample_idx] * patch_size + first_block_prompt_count)
         trim_count = max(0, min(int(trim_count), context_ids_cpu.shape[1]))
+
         trimmed_ids.append(context_ids_cpu[sample_idx, trim_count:].tolist())
+
     generated_texts = tokenizer.decode_batch(trimmed_ids, skip_special_tokens=False)
     generated_texts_full = tokenizer.decode_batch([e[pad_prefix_len:].tolist() for e, pad_prefix_len in zip(context_ids_cpu, prompt_prefix_pad_lens)], skip_special_tokens=False)
 
